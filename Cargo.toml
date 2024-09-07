@@ -1,19 +1,18 @@
 [package]
-name = "qvd"
-version = "0.0.15"
-authors = ["Sam Bentley <samtbentley@gmail.com>"]
-edition = "2018"
+name = "qvd_extract_reader"
+version = "1.0.0"
+authors = ["Janerose Njogu <janerose.njogu@eoncollective.com>"]
+edition = "2024"
 readme = "README.md"
-description = "A library for reading Qlik Sense .qvd file format from Python, written in Rust."
+description = "A library for reading data from QVD extract file. Written in Rust."
 license = "Apache-2.0"
-repository = "https://github.com/SBentley/qvd-utils"
-keywords = ["python", "rust", "qlik", "sense", "qvd"]
+repository = "https://github.com/janerose-njogu/qvd-extract-reader"
+keywords = ["extract", "qlikview", "qlik", "qliksense", "qvd"]
 
 
 [lib]
-name = "qvd"
+name = "qvd_extract_reader"
 crate-type = ["cdylib"]
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 serde = { version = "1.0.117", features = ["derive"] }
