@@ -1,68 +1,153 @@
 use bitvec::prelude::*;
+use bitvec::slice::BitSlice;
+use pyo3::PyErr;
+use duckdb::{params, Connection, Result}; 
 use pyo3::wrap_pyfunction;
-use pyo3::{prelude::*, types::PyDict};
+use pyo3::prelude::*;
 use quick_xml::de::from_str;
 use qvd_structure::{QvdFieldHeader, QvdTableHeader};
 use std::io::SeekFrom;
 use std::io::{self, Read};
 use std::path::Path;
+use std::slice::ChunksMut;
 use std::str;
 use std::{collections::HashMap, fs::File};
 use std::{convert::TryInto, io::prelude::*};
+use regex::Regex;
+
 pub mod qvd_structure;
 
+const DEFAULT_CHUNK_SIZE: usize = 2; // Default chunk size for reading data in GB.
+
 #[pymodule]
-fn qvd(_py: Python, m: &PyModule) -> PyResult<()> {
+fn qvd_utils(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_qvd, m)?)?;
 
     Ok(())
 }
 
 #[pyfunction]
-fn read_qvd(py: Python, file_name: String) -> PyResult<Py<PyDict>> {
-    let xml: String = get_xml_data(&file_name).expect("Error reading file");
-    let dict = PyDict::new(py);
-    let binary_section_offset = xml.as_bytes().len();
+fn read_qvd(py: Python, qvd_file_name: String, chunk_size: Option<usize>) -> PyResult<()> {
+    let chunk_size_in_bytes: usize = if chunk_size.unwrap_or(0) > 0 {
+        chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE) * 1024 * 1024 * 1024
+    } else {
+        DEFAULT_CHUNK_SIZE * 1024 * 1024 * 1024
+    };
+    let duck_db_conn: Connection = Connection::open_in_memory().expect("Error opening connection to DuckDB");
+
+    let xml: String = get_xml_data(&qvd_file_name).expect("Error reading QVD extract file");
+    // let dict = PyDict::new(py);
+    let binary_section_offset: usize = xml.as_bytes().len();
 
     let qvd_structure: QvdTableHeader = from_str(&xml).unwrap();
     let mut symbol_map: HashMap<String, Vec<Option<String>>> = HashMap::new();
 
-    if let Ok(f) = File::open(&file_name) {
-        // Seek to the end of the XML section
-        let buf = read_qvd_to_buf(f, binary_section_offset);
-        let rows_start = qvd_structure.offset;
-        let rows_end = buf.len();
-        let rows_section = &buf[rows_start..rows_end];
-        let record_byte_size = qvd_structure.record_byte_size;
+    // Define table schema in DuckDB based on QVD fields
+    let formatted_table_name: String = format_convert_to_snake_case(&qvd_file_name);
+    let mut create_table_query: String = format!("CREATE TABLE {} (", formatted_table_name);
+    for field in &qvd_structure.fields.headers {
+        create_table_query.push_str(&format!("{} TEXT,", field.field_name));
+    }
+    create_table_query.pop(); // Remove trailing comma
+    create_table_query.push_str(");");
 
-        for field in qvd_structure.fields.headers {
-            symbol_map.insert(
-                field.field_name.clone(),
-                get_symbols_as_strings(&buf, &field),
-            );
-            let symbol_indexes = get_row_indexes(&rows_section, &field, record_byte_size);
-            let column_values =
-                match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
-            dict.set_item(field.field_name, column_values).unwrap();
+    // Execute the CREATE TABLE query in DuckDB
+    duck_db_conn.execute(&create_table_query, []).expect("Error creating table");
+
+    // Open the QVD file and process it
+    if let Ok(f) = File::open(&qvd_file_name) {
+        let mut binary_section_offset = binary_section_offset;
+        
+        loop {
+            // Recursively read the next chunk of the file
+            let buf = read_qvd_extract_data_to_buf(f.try_clone().unwrap(), binary_section_offset, chunk_size_in_bytes);
+            
+            // If no more data is read, exit the loop
+            if buf.is_empty() {
+                break;
+            }
+            let rows_start = 0;
+            let rows_end = buf.len();
+            let rows_section = &buf[rows_start..rows_end];
+            let record_byte_size = qvd_structure.record_byte_size;
+
+            for field in &qvd_structure.fields.headers {
+                symbol_map.insert(
+                    field.field_name.clone(),
+                    get_symbols_as_strings(&buf, &field),
+                );
+                let symbol_indexes = get_row_indexes(&rows_section, &field, record_byte_size);
+                let column_values = match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
+                dbg!(&symbol_indexes);
+                dbg!(&column_values);
+            }
+            //     // Insert statement
+            //     let insert_query = format!(
+            //         "INSERT INTO {} ({}) VALUES ({})",
+            //         formatted_table_name,
+            //         qvd_structure
+            //             .fields
+            //             .headers
+            //             .iter()
+            //             .map(|f| f.field_name.clone())
+            //             .collect::<Vec<String>>()
+            //             .join(", "),
+            //         qvd_structure
+            //             .fields
+            //             .headers
+            //             .iter()
+            //             .map(|_| "?".to_string())
+            //             .collect::<Vec<String>>()
+            //             .join(", ")
+            //     );
+            //     let mut row_values = Vec::new();
+            //     for value in column_values {
+            //         row_values.push(value.unwrap_or_default());
+            //     }
+            //     // Convert row_values to Value
+            //     let duckdb_values: Vec<Value> = row_values
+            //         .iter()
+            //         .map(|value| Value::Text(value.clone()))
+            //         .collect();
+
+            //     let insert_statement = duck_db_conn.prepare(&insert_query).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("DuckDB error: {}", e)))?;
+            //     // Execute the INSERT query
+            //     insert_statement.execute(&duckdb_values[..]).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("DuckDB error: {}", e)))?;
+            // }
+            // Update the binary section offset for the next chunk
+            binary_section_offset += buf.len();
         }
     }
-    Ok(dict.into())
+    Ok(())
 }
 
-fn read_qvd_to_buf(mut f: File, binary_section_offset: usize) -> Vec<u8> {
-    f.seek(SeekFrom::Start(binary_section_offset as u64))
-        .unwrap();
-    let mut buf: Vec<u8> = Vec::new();
-    f.read_to_end(&mut buf).unwrap();
+fn read_qvd_extract_data_to_buf(mut f: File, offset: usize, chunk_size: usize) -> Vec<u8> {
+    let mut buf = vec![0; chunk_size];
+    f.seek(SeekFrom::Start(offset as u64)).unwrap();
+    let bytes_read = f.read(&mut buf).unwrap();
+    buf.truncate(bytes_read); // Resize the buffer to the actual number of bytes read
     buf
+}
+
+fn format_convert_to_snake_case(input_string: &str) -> String {
+    // Define a regex to match any punctuation symbol
+    let re: Regex = Regex::new(r"[^\w\s]").unwrap();
+    let cleaned_string = input_string.trim()  // Remove leading and trailing whitespaces
+        .replace(" ", "_")  // Replace spaces with underscores
+        .replace("-", "_")  // Optionally, replace hyphens with underscores
+        .to_lowercase();  // Convert to lowercase
+        // Remove punctuation symbols
+        re.replace_all(&cleaned_string, "").to_string()
 }
 
 fn match_symbols_with_indexes(symbols: &[Option<String>], pointers: &[i64]) -> Vec<Option<String>> {
     let mut cols: Vec<Option<String>> = Vec::new();
     for pointer in pointers.iter() {
-        if symbols.is_empty() || *pointer < 0 {
+        if symbols.is_empty() || *pointer < 0 || *pointer as usize >= symbols.len() {
+            // Push None if symbols are empty, pointer is negative, or out of bounds
             cols.push(None);
         } else {
+            // Safely clone the symbol if pointer is within bounds
             cols.push(symbols[*pointer as usize].clone());
         }
     }
@@ -136,19 +221,24 @@ fn get_symbols_as_strings(buf: &[u8], field: &QvdFieldHeader) -> Vec<Option<Stri
     strings
 }
 
-// Retrieve bit stuffed data. Each row has index to value from symbol map.
 fn get_row_indexes(buf: &[u8], field: &QvdFieldHeader, record_byte_size: usize) -> Vec<i64> {
-    let mut cloned_buf = buf.to_owned();
-    let chunks = cloned_buf.chunks_mut(record_byte_size);
+    // Retrieve bit stuffed data. Each row has index to value from symbol map.
+    let mut cloned_buf: Vec<u8> = buf.to_owned();
+    let chunks: ChunksMut<'_, u8> = cloned_buf.chunks_mut(record_byte_size);
     let mut indexes: Vec<i64> = Vec::new();
     for chunk in chunks {
         // Reverse the bytes in the record
         chunk.reverse();
-        let bits = BitSlice::<Msb0, _>::from_slice(&chunk[..]).unwrap();
-        let start = bits.len() - field.bit_offset;
-        let end = bits.len() - field.bit_offset - field.bit_width;
-        let binary = bitslice_to_vec(&bits[end..start]);
-        let index = binary_to_u32(binary);
+        let bits: &BitSlice<Msb0, u8> = BitSlice::<Msb0, _>::from_slice(&chunk[..]).unwrap();
+        let len: usize = bits.len();
+        let start: usize = len.checked_sub(field.bit_offset).unwrap_or(0);
+        let end: usize = start.checked_sub(field.bit_width).unwrap_or(0);
+        if start <= end || end >= len {
+            // Skip this chunk if indices are out of bounds
+            continue;
+        }
+        let binary: Vec<u8> = bitslice_to_vec(&bits[end..start]);
+        let index: u32 = binary_to_u32(binary);
         indexes.push((index as i32 + field.bias) as i64);
     }
     indexes
@@ -177,8 +267,8 @@ fn bitslice_to_vec(bitslice: &BitSlice<Msb0, u8>) -> Vec<u8> {
     v
 }
 
-fn get_xml_data(file_name: &str) -> Result<String, io::Error> {
-    match read_file(file_name) {
+fn get_xml_data(qvd_file_name: &str) -> Result<String, io::Error> {
+    match read_file(qvd_file_name) {
         Ok(mut reader) => {
             let mut buffer = Vec::new();
             // There is a line break, carriage return and a null terminator between the XMl and data

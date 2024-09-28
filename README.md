@@ -1,34 +1,40 @@
 # Read Qlik Sense .qvd files 🛠
+TODO:
 [![CI pipeline](https://github.com/SBentley/qvd-utils/actions/workflows/CI.yml/badge.svg)](https://github.com/SBentley/qvd-utils/actions/workflows/CI.yml)
 
-A python library for reading Qlik Sense .qvd file format, written in Rust.
-Files can be read to DataFrame or dictionary.
+A python library for reading QVD Extract files. Written in Rust.
+Files can be read to DataFrame or dictionary object.
 
 ## Install
 
+TODO:
 Install from PyPi https://pypi.org/project/qvd/
 
 ```sh
-pip install qvd
+pip install qvd_extract_reader
 ```
 
 ## Usage
 
 ```python
-from qvd import qvd_reader
+from qvd_extract_reader import qvd_reader
 
-df = qvd_reader.read('test.qvd')
-print(df)
+qvd_df = qvd_reader.read('test_extract.qvd')
+print(qvd_df)
 ```
 
-![example](https://raw.githubusercontent.com/SBentley/qvd-utils/master/example.png)
+![example](etc/example.png)
 
 ### Developing
 
 Create a virtual env https://docs.python-guide.org/dev/virtualenvs/ and activate it.
 
 ```sh
-python3 -m venv venv
+python3 -m venv .venv
+```
+OR
+```sh
+python -m venv .venv
 ```
 
 Then install dev dependencies:
