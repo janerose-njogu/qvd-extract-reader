@@ -36,4 +36,6 @@ pub struct QvdFieldHeader {
     pub offset: usize,
     #[serde(rename = "Length")]
     pub length: usize,
+    #[serde(rename = "NoOfSymbols")]
+    pub no_of_symbols: usize,
 }
