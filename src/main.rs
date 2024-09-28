@@ -1,32 +1,18 @@
 use bitvec::prelude::*;
-use bitvec::slice::BitSlice;
-use byteorder::{LittleEndian, ReadBytesExt};
-use pyo3::{prelude::*, PyErr, exceptions::PyRuntimeError, types::PyDict};
-use duckdb::{Connection, Result, types::ToSql}; 
+use pyo3::wrap_pyfunction;
+use pyo3::{prelude::*, types::PyDict};
 use quick_xml::de::from_str;
 use qvd_structure::{QvdFieldHeader, QvdTableHeader};
-use std::io::{SeekFrom, Cursor, self, Read, BufReader, ErrorKind};
-use std::os::windows::fs::MetadataExt;
+use regex::Regex;
+use std::io::SeekFrom;
+use std::io::{self, Read};
 use std::path::Path;
 use std::str;
-use std::slice::{Chunks,ChunksMut};
-use std::{collections::HashMap, fs::File,fs::metadata};
+use std::{collections::HashMap, fs::File};
 use std::{convert::TryInto, io::prelude::*};
-use regex::Regex;
 pub mod qvd_structure;
 
-const DEFAULT_CHUNK_SIZE: usize = 2; // Default chunk size for reading data in GB.
-
-fn read_qvd_in_chunks(f: &mut File, offset: usize, chunk_size: usize) -> Result<Vec<u8>, io::Error> {
-    f.seek(SeekFrom::Start(offset as u64))?;
-    let mut file_reader: BufReader<&mut File> = BufReader::new(f);
-    let mut buf: Vec<u8> = vec![0; chunk_size]; 
-    
-    let bytes_read = file_reader.read(&mut buf)?;
-    
-    buf.truncate(bytes_read);
-    Ok(buf)
-}
+const DEFAULT_READ_LINES: usize = 2; // the default number of lines to read
 
 fn format_convert_to_snake_case(input_string: &str) -> String {
     // Define a regex to match any punctuation symbol
@@ -39,14 +25,36 @@ fn format_convert_to_snake_case(input_string: &str) -> String {
         re.replace_all(&cleaned_string, "").to_string()
 }
 
+fn read_qvd_to_buf<'py>(f: &mut File, binary_section_offset: usize, qvd_fields: &mut Vec<QvdFieldHeader>, py: Python<'py>) -> &'py PyDict {
+    let records_to_insert: &PyDict = PyDict::new(py);
+    let mut symbol_map: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    for field in qvd_fields {
+        let total_offset: usize = binary_section_offset + field.offset;
+        f.seek(SeekFrom::Start(total_offset as u64)).unwrap();
+        let mut buffer: Vec<u8> = vec![0; field.bit_width + 1];
+        f.read_exact(&mut buffer).unwrap();
+        
+        symbol_map.insert(
+            field.field_name.clone(),
+            get_symbols_as_strings(&buffer, &field),
+        );
+        // let symbol_indexes: Vec<i64> = get_row_indexes(&rows_section, &field, record_byte_size);
+        // let column_values: Vec<Option<String>> =match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
+        // Insert the field's value into the dictionary with the field name as the key
+        // records_to_insert.set_item(field.field_name.clone(), value).unwrap();
+    }
+    println!("Symbol Map: {:?}", symbol_map);
+
+    // Return the dictionary with the read data
+    records_to_insert
+}
+
 fn match_symbols_with_indexes(symbols: &[Option<String>], pointers: &[i64]) -> Vec<Option<String>> {
     let mut cols: Vec<Option<String>> = Vec::new();
     for pointer in pointers.iter() {
-        if symbols.is_empty() || *pointer < 0 || *pointer as usize >= symbols.len() {
-            // Push None if symbols are empty, pointer is negative, or out of bounds
+        if symbols.is_empty() || *pointer < 0 {
             cols.push(None);
         } else {
-            // Safely clone the symbol if pointer is within bounds
             cols.push(symbols[*pointer as usize].clone());
         }
     }
@@ -54,172 +62,133 @@ fn match_symbols_with_indexes(symbols: &[Option<String>], pointers: &[i64]) -> V
 }
 
 fn get_symbols_as_strings(buf: &[u8], field: &QvdFieldHeader) -> Vec<Option<String>> {
-    let start: usize = field.offset;
-    let mut end: usize = start + field.length;
-    if start >= buf.len() {
-        println!("Start index out of bounds: {} for buffer of length {}", start, buf.len());
-    }
-    if end > buf.len() {
-        end = buf.len();
-    }
     let mut strings: Vec<Option<String>> = Vec::new();
-
-    let mut cursor: Cursor<&[u8]> = Cursor::new(&buf[start..end]);
-    while cursor.position() < end as u64 {
-        let remaining: u64 = (end as u64) - cursor.position();
-         if remaining < 1 {
-            break; // Not enough data for a full type, exit loop
-        }
-        let byte = match cursor.read_u8() {
-            Ok(b) => b,
-            Err(_) => break, // Error in reading, likely due to EOF
-        };
-         if end > buf.len() {
-        end = buf.len();
-        }
+    
+    if buf.len() > 0 {
+        // Check first byte of symbol. This is not part of the symbol but tells us what type of data to read.
+        let byte: &u8 = &buf[0];
+        println!("Buffer: {:?}", buf);
+        println!("Byte: {}", byte);
         println!("field: {}", field.field_name);
-        println!("Byte type: {}", byte);
-
+        
         match byte {
             0 => {
-                // Read null-terminated string
-                let mut string_bytes = Vec::new();
-                loop {
-                    if remaining < 1 || cursor.position() >= end as u64 {
-                        break; // No more data to read
-                    }
-                    let next_byte = cursor.read_u8().unwrap_or(0);
-                    if next_byte == 0 {
-                        break; // Null terminator reached
-                    }
-                    string_bytes.push(next_byte);
+                if let Some(null_pos) = buf.iter().position(|&x| x == 0x00) {
+                    // Take the bytes up to the null terminator
+                    let utf8_bytes: Vec<u8> = buf[..null_pos].to_vec();
+                    
+                    // Convert to a UTF-8 string
+                    let value: String = String::from_utf8(utf8_bytes).unwrap_or_else(|_| {
+                        panic!("Error parsing string value in field: {}", field.field_name)
+                    });
+                    
+                    // Push the resulting string into the `strings` vector
+                    strings.push(Some(value));
+                } else {
+                    // If there's no null byte, handle this as an error or just take the entire buffer
+                    let value: String = String::from_utf8(buf.to_vec()).unwrap_or_else(|_| {
+                        panic!("Error parsing string value in field: {}", field.field_name)
+                    });
+                    strings.push(Some(value));
                 }
-                let value = String::from_utf8(string_bytes).unwrap_or_else(|_| {
-                    panic!(
-                        "Error parsing string value in field: {}, position: {}",
-                        field.field_name,
-                        cursor.position()
-                    )
-                });
-                strings.push(Some(value));
-            }
+                }
             1 => {
-                // Check if there's enough data for a 4-byte integer
-                if remaining < 4 {
-                    break; // Not enough bytes for an integer, exit loop
+                    // 4 byte integer
+                    let mut target_bytes: Vec<u8> = vec![0; 4]; // Initialize a vector to hold 4 bytes
+                    if buf.len() >= 5 {
+                        // If the buffer has enough bytes, copy the relevant bytes
+                        target_bytes.copy_from_slice(&buf[1..5]);
+                    } else {
+                        // If the buffer is too short, copy available bytes and pad with zeros
+                        let bytes_to_copy = buf.len() - 1; // Subtract 1 because we're starting from index 1
+                        target_bytes[..bytes_to_copy].copy_from_slice(&buf[1..]); // Copy available bytes
+                    }
+                    
+                    // Now convert to an array
+                    let byte_array: [u8; 4] = target_bytes.try_into().unwrap();
+                    
+                    // Convert to numeric value
+                    let numeric_value: i32 = i32::from_le_bytes(byte_array);
+                    strings.push(Some(numeric_value.to_string()));
                 }
-                let value = cursor.read_i32::<LittleEndian>().unwrap();
-                strings.push(Some(value.to_string()));
-            }
             2 => {
-                // Check if there's enough data for an 8-byte double
-                if remaining < 8 {
-                    break; // Not enough bytes for a double, exit loop
+                    // 4 byte double
+                    let target_bytes: Vec<u8> = buf[1..9].to_vec();
+                    let byte_array: [u8; 8] = target_bytes.try_into().unwrap();
+                    let numeric_value: f64 = f64::from_le_bytes(byte_array);
+                    strings.push(Some(numeric_value.to_string()));
+                    // i += 9;
                 }
-                let value = cursor.read_f64::<LittleEndian>().unwrap();
-                strings.push(Some(value.to_string()));
-            }
-            4 => {
-                // Read null-terminated string
-                let mut string_bytes = Vec::new();
-                loop {
-                    if remaining < 1 || cursor.position() >= end as u64 {
-                        break; // No more data to read
+                4 => {
+                    if buf.len() > 1 {
+                        // First, check for the active/inactive case
+                        if buf[1] == 49 {
+                            // Byte 49 is ASCII for '1', meaning active
+                            strings.push(Some("1".to_string()));
+                        } else if buf[1] == 48 {
+                            // Byte 48 is ASCII for '0', meaning inactive
+                            strings.push(Some("0".to_string()));
+                        } else {
+                            // Otherwise, handle as a regular null-terminated string
+                            let string_buf: &[u8] = &buf[1..]; // Start after `0x04`
+                
+                            if let Some(null_pos) = string_buf.iter().position(|&x| x == 0x00) {
+                                // Take the bytes up to the null terminator
+                                let utf8_bytes: Vec<u8> = string_buf[..null_pos].to_vec();
+                                
+                                // Convert to a UTF-8 string
+                                let value: String = String::from_utf8(utf8_bytes).unwrap_or_else(|_| {
+                                    panic!("Error parsing string value in field: {}", field.field_name)
+                                });
+                                
+                                // Push the resulting string into the `strings` vector
+                                strings.push(Some(value));
+                            } else {
+                                // If there's no null byte, handle as a full string
+                                let value: String = String::from_utf8(string_buf.to_vec()).unwrap_or_else(|_| {
+                                    panic!("Error parsing string value in field: {}", field.field_name)
+                                });
+                                strings.push(Some(value));
+                            }
+                        }
+                    } else {
+                        panic!("Unexpected buffer length for string in field: {}", field.field_name);
                     }
-                    let next_byte = cursor.read_u8().unwrap_or(0);
-                    if next_byte == 0 {
-                        break; // Null terminator reached
-                    }
-                    string_bytes.push(next_byte);
-                }
-                let value = String::from_utf8(string_bytes).unwrap_or_else(|_| {
-                    panic!(
-                        "Error parsing string value in field: {}, position: {}",
-                        field.field_name,
-                        cursor.position()
-                    )
-                });
-                strings.push(Some(value));
-            }
+                }            
             5 => {
-                // Check if there's enough data to skip 4 bytes
-                if remaining < 4 {
-                    break; // Not enough bytes, exit loop
-                }
-                cursor.seek(SeekFrom::Current(4)).unwrap(); // Skip 4 bytes
-                let mut string_bytes = Vec::new();
-                loop {
-                    if remaining < 1 || cursor.position() >= end as u64 {
-                        break; // No more data to read
-                    }
-                    let next_byte = cursor.read_u8().unwrap_or(0);
-                    if next_byte == 0 {
-                        break; // Null terminator reached
-                    }
-                    string_bytes.push(next_byte);
-                }
-                let value = String::from_utf8(string_bytes).unwrap_or_else(|_| {
-                    panic!(
-                        "Error parsing string value in field: {}, position: {}",
-                        field.field_name,
-                        cursor.position()
-                    )
-                });
-                strings.push(Some(value));
+                    // 4 bytes of unknown followed by null terminated string
+                    // Skip the 4 bytes before string
+                    // i += 5;
+                    // string_start = i;
             }
             6 => {
-                // Check if there's enough data to skip 8 bytes
-                if remaining < 8 {
-                    break; // Not enough bytes, exit loop
-                }
-                cursor.seek(SeekFrom::Current(8)).unwrap(); // Skip 8 bytes
-                let mut string_bytes = Vec::new();
-                loop {
-                    if remaining < 1 || cursor.position() >= end as u64 {
-                        break; // No more data to read
-                    }
-                    let next_byte = cursor.read_u8().unwrap_or(0);
-                    if next_byte == 0 {
-                        break; // Null terminator reached
-                    }
-                    string_bytes.push(next_byte);
-                }
-                let value = String::from_utf8(string_bytes).unwrap_or_else(|_| {
-                    panic!(
-                        "Error parsing string value in field: {}, position: {}",
-                        field.field_name,
-                        cursor.position()
-                    )
-                });
-                strings.push(Some(value));
+                    // 8 bytes of unknown followed by null terminated string
+                    // Skip the 8 bytes before string
+                    // i += 9;
+                    // string_start = i;
             }
-            _ => {
-                // Handle unexpected bytes gracefully by skipping unknown types
-                println!("Unknown byte type: {}", byte);
+                _ => {
+                    // Part of a string, do nothing until null terminator
+                    // i += 1;
             }
-        }
+         }
     }
     strings
 }
 
+// Retrieve bit stuffed data. Each row has index to value from symbol map.
 fn get_row_indexes(buf: &[u8], field: &QvdFieldHeader, record_byte_size: usize) -> Vec<i64> {
-    // Retrieve bit stuffed data. Each row has index to value from symbol map.
-    let mut cloned_buf: Vec<u8> = buf.to_owned();
-    let chunks: ChunksMut<'_, u8> = cloned_buf.chunks_mut(record_byte_size);
+    let mut cloned_buf = buf.to_owned();
+    let chunks = cloned_buf.chunks_mut(record_byte_size);
     let mut indexes: Vec<i64> = Vec::new();
     for chunk in chunks {
         // Reverse the bytes in the record
         chunk.reverse();
-        let bits: &BitSlice<Msb0, u8> = BitSlice::<Msb0, _>::from_slice(&chunk[..]).unwrap();
-        let len: usize = bits.len();
-        let start: usize = len.checked_sub(field.bit_offset).unwrap_or(0);
-        let end: usize = start.checked_sub(field.bit_width).unwrap_or(0);
-        if start <= end || end >= len {
-            // Skip this chunk if indices are out of bounds
-            continue;
-        }
-        let binary: Vec<u8> = bitslice_to_vec(&bits[end..start]);
-        let index: u32 = binary_to_u32(binary);
+        let bits = BitSlice::<Msb0, _>::from_slice(&chunk[..]).unwrap();
+        let start = bits.len() - field.bit_offset;
+        let end = bits.len() - field.bit_offset - field.bit_width;
+        let binary = bitslice_to_vec(&bits[end..start]);
+        let index = binary_to_u32(binary);
         indexes.push((index as i32 + field.bias) as i64);
     }
     indexes
@@ -239,7 +208,7 @@ fn binary_to_u32(binary: Vec<u8>) -> u32 {
 fn bitslice_to_vec(bitslice: &BitSlice<Msb0, u8>) -> Vec<u8> {
     let mut v: Vec<u8> = Vec::new();
     for bit in bitslice {
-        let val: u8 = match bit {
+        let val = match bit {
             true => 1,
             false => 0,
         };
@@ -248,8 +217,8 @@ fn bitslice_to_vec(bitslice: &BitSlice<Msb0, u8>) -> Vec<u8> {
     v
 }
 
-fn get_xml_data(qvd_file_path: &str) -> Result<String, io::Error> {
-    match read_file(qvd_file_path) {
+fn get_xml_data(file_name: &str) -> Result<String, io::Error> {
+    match read_file(file_name) {
         Ok(mut reader) => {
             let mut buffer = Vec::new();
             // There is a line break, carriage return and a null terminator between the XMl and data
@@ -257,7 +226,7 @@ fn get_xml_data(qvd_file_path: &str) -> Result<String, io::Error> {
             reader
                 .read_until(0, &mut buffer)
                 .expect("Failed to read file");
-            let xml_string: &str =
+            let xml_string =
                 str::from_utf8(&buffer[..]).expect("xml section contains invalid UTF-8 chars");
             Ok(xml_string.to_owned())
         }
@@ -269,87 +238,73 @@ fn read_file<P>(filename: P) -> io::Result<io::BufReader<File>>
 where
     P: AsRef<Path>,
 {
-    let file: File = File::open(filename)?;
+    let file = File::open(filename)?;
     Ok(io::BufReader::new(file))
 }
-
 fn main() -> std::io::Result<()> {
     let qvd_file_path: &str = r"C:\Users\LENOVO\Documents\Client Projects\USC Keck\extracts\Orders_Restraint_All.qvd";
-    let chunk_size: Option<usize> =Some(2);
-    let chunk_size_in_bytes: usize = if chunk_size.unwrap_or(0) > 0 {
-        chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE) * 1024 * 1024
+    let read_lines: Option<usize> =Some(2);
+    let no_of_lines_to_read: usize = if read_lines.unwrap_or(0) > 0 {
+        read_lines.unwrap_or(DEFAULT_READ_LINES) * 1000
     } else {
-        DEFAULT_CHUNK_SIZE * 1024 * 1024
+        DEFAULT_READ_LINES * 1000
     };
-
-    let xml_data: String = get_xml_data(&qvd_file_path).expect("Error reading file");
-    let qvd_structure: QvdTableHeader = from_str(&xml_data).unwrap(); 
-
-    let mut binary_section_offset: usize = xml_data.as_bytes().len();
+    println!("Lines to read: {}", no_of_lines_to_read);
+    
+    let xml_metadata: String = get_xml_data(&qvd_file_path).expect("Error reading file");
+    let qvd_structure: QvdTableHeader = from_str(&xml_metadata).unwrap(); 
+    
+    let mut binary_section_offset: usize = xml_metadata.as_bytes().len();
     let mut symbol_map: HashMap<String, Vec<Option<String>>> = HashMap::new();
     
     // Acquire Python interpreter context
     Python::with_gil(|py: Python<'_>| {
-    let dict: &PyDict = PyDict::new(py);
-    // CREATE TABLE IN DUCKDB
-    let duck_db_conn: Connection = Connection::open("extract_qvd.db").expect("Error connecting to DuckDB database");
-
+    // let duck_db_conn: Connection = Connection::open("extract_qvd.db").expect("Error connecting to DuckDB database");
+    
     let formatted_table_name: String = format_convert_to_snake_case(&qvd_structure.table_name);
-    let mut create_table_query = format!("CREATE TABLE IF NOT EXISTS {} (", formatted_table_name);
+    let mut create_table_query: String = format!("CREATE TABLE IF NOT EXISTS {} (", formatted_table_name);
 
-    let column_names: Vec<String> = qvd_structure.fields.headers.iter().map(|field: &QvdFieldHeader| format_convert_to_snake_case(&field.field_name)).collect();
-    let column_count: &usize = &column_names.len();
+    println!("table name: {}", formatted_table_name);
+    
+    let row_count: u32 = qvd_structure.no_of_records;
+    println!("row count: {}", row_count);
+    
+    let mut qvd_fields: Vec<QvdFieldHeader> = qvd_structure.fields.headers;
+    let column_names: Vec<String> = qvd_fields.iter().map(|field: &QvdFieldHeader| format_convert_to_snake_case(&field.field_name)).collect();
+    
+    let column_count: usize = column_names.len();
+    println!("field count: {}", column_count);
+    
     for field in &column_names {
         create_table_query.push_str(&format!("{} TEXT,", format_convert_to_snake_case(&field)));
     }
     create_table_query.pop(); // Remove trailing comma
     create_table_query.push_str(");");
 
-    duck_db_conn.execute(&create_table_query, []).expect("Error creating table");
+    // duck_db_conn.execute(&create_table_query, []).expect("Error creating table");
+    
     if let Ok(mut f) = File::open(&qvd_file_path) {
-        while let Ok(data_chunk) = read_qvd_in_chunks(&mut f, binary_section_offset, chunk_size_in_bytes) {
-            // let data_chunk: Vec<u8> = read_qvd_in_chunks(&mut f, binary_section_offset, lines_to_read)?;
-            println!("Chunk size: {}", data_chunk.len());
-            if data_chunk.is_empty(){
-                    break;
-            }
-            let record_byte_size: usize = qvd_structure.record_byte_size;
+        let record_byte_size: usize = qvd_structure.record_byte_size;
             let placeholders: Vec<String> = column_names.iter().map(|_| "?".to_string()).collect();
-            let insert_query = format!(
+            let insert_query: String = format!(
                     "INSERT INTO {} ({}) VALUES ({})",
                     formatted_table_name,
                     column_names.join(", "),
                     placeholders.join(", ")
             );
-            for field in &qvd_structure.fields.headers {
-                symbol_map.insert(
-                        field.field_name.clone(),
-                        get_symbols_as_strings(&data_chunk, &field),
-                );
+            let mut inserted_count: u32 = 0;
+            while inserted_count < 2 {
+                let records_to_insert: &PyDict = read_qvd_to_buf(&mut f, binary_section_offset, &mut qvd_fields, py);
+                
+                println!("record count: {}", records_to_insert.len());
 
-                    // let symbol_indexes: Vec<i64> = get_row_indexes(&data_chunk, &field, record_byte_size);
-                    // let column_values: Vec<Option<String>> = match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
-                    // let record_count: usize = column_values.len();
-                    // println!("No of records: {}", record_count);
-                    // for record_index in 0..record_count {
-                        // records to be inserted in duck db
-                        // let mut row_values:  Vec<&(dyn ToSql + 'static)> = Vec::new();
-                        
-                // //         // For each column, get the value at the current row index
-                // //         for i in 0..column_count  {
-                // //             let value: &(dyn ToSql + 'static) = match &column_values[i] {
-                // //                 Some(val) => Box::leak(Box::new(val.clone())),
-                // //                 None => Box::leak(Box::new(String::new())),
-                // //             };
-                // //             row_values.push(value);
-                // //         }
-                // //         // Execute the insert query for each row
-                // //         duck_db_conn.execute(&insert_query, &row_values[..])?;
-                //     }
+                inserted_count += records_to_insert.len() as u32;
+                break;
             }
-            binary_section_offset += chunk_size_in_bytes; // Move offset for the next chunk
-        }
     }
+    });
     Ok(())
-})
+}
+#[cfg(test)]
+mod tests {
 }
