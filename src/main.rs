@@ -25,18 +25,16 @@ fn format_convert_to_snake_case(input_string: &str) -> String {
         re.replace_all(&cleaned_string, "").to_string()
 }
 
-fn read_qvd_to_buf<'py>(f: &mut File, binary_section_offset: usize, qvd_fields: &mut Vec<QvdFieldHeader>, py: Python<'py>) -> &'py PyDict {
-    let records_to_insert: &PyDict = PyDict::new(py);
+fn read_qvd_to_buf<'py>(f: &mut File, binary_section_offset: usize, qvd_fields: &mut Vec<QvdFieldHeader>, record_count: usize) -> HashMap<String, Vec<Option<String>>> {
     let mut symbol_map: HashMap<String, Vec<Option<String>>> = HashMap::new();
     for field in qvd_fields {
-        let total_offset: usize = binary_section_offset + field.offset;
+        let total_offset: usize = binary_section_offset + field.offset + (field.bit_width*record_count);
         f.seek(SeekFrom::Start(total_offset as u64)).unwrap();
         let mut buffer: Vec<u8> = vec![0; field.bit_width + 1];
         f.read_exact(&mut buffer).unwrap();
-        
         symbol_map.insert(
-            field.field_name.clone(),
-            get_symbols_as_strings(&buffer, &field),
+                field.field_name.clone(),
+                get_symbols_as_strings(&buffer, &field),
         );
         // let symbol_indexes: Vec<i64> = get_row_indexes(&rows_section, &field, record_byte_size);
         // let column_values: Vec<Option<String>> =match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
@@ -44,9 +42,8 @@ fn read_qvd_to_buf<'py>(f: &mut File, binary_section_offset: usize, qvd_fields: 
         // records_to_insert.set_item(field.field_name.clone(), value).unwrap();
     }
     println!("Symbol Map: {:?}", symbol_map);
-
     // Return the dictionary with the read data
-    records_to_insert
+    symbol_map
 }
 
 fn match_symbols_with_indexes(symbols: &[Option<String>], pointers: &[i64]) -> Vec<Option<String>> {
@@ -63,29 +60,23 @@ fn match_symbols_with_indexes(symbols: &[Option<String>], pointers: &[i64]) -> V
 
 fn get_symbols_as_strings(buf: &[u8], field: &QvdFieldHeader) -> Vec<Option<String>> {
     let mut strings: Vec<Option<String>> = Vec::new();
-    
     if buf.len() > 0 {
         // Check first byte of symbol. This is not part of the symbol but tells us what type of data to read.
         let byte: &u8 = &buf[0];
-        println!("Buffer: {:?}", buf);
-        println!("Byte: {}", byte);
         println!("field: {}", field.field_name);
-        
+        println!("Buffer: {:?}", buf);
+        println!("Byte size: {}", buf.len());
+        println!("Byte: {}", byte);        
+
         match byte {
             0 => {
                 if let Some(null_pos) = buf.iter().position(|&x| x == 0x00) {
-                    // Take the bytes up to the null terminator
                     let utf8_bytes: Vec<u8> = buf[..null_pos].to_vec();
-                    
-                    // Convert to a UTF-8 string
                     let value: String = String::from_utf8(utf8_bytes).unwrap_or_else(|_| {
                         panic!("Error parsing string value in field: {}", field.field_name)
                     });
-                    
-                    // Push the resulting string into the `strings` vector
                     strings.push(Some(value));
                 } else {
-                    // If there's no null byte, handle this as an error or just take the entire buffer
                     let value: String = String::from_utf8(buf.to_vec()).unwrap_or_else(|_| {
                         panic!("Error parsing string value in field: {}", field.field_name)
                     });
@@ -93,23 +84,22 @@ fn get_symbols_as_strings(buf: &[u8], field: &QvdFieldHeader) -> Vec<Option<Stri
                 }
                 }
             1 => {
+                    if buf.len() == 1{
+                        // single byte integer e.g. boolean 0 or 1
+                        strings.push(Some(buf[0].to_string()));
+                    }else{
                     // 4 byte integer
-                    let mut target_bytes: Vec<u8> = vec![0; 4]; // Initialize a vector to hold 4 bytes
+                    let mut target_bytes: Vec<u8> = vec![0; 4];
                     if buf.len() >= 5 {
-                        // If the buffer has enough bytes, copy the relevant bytes
                         target_bytes.copy_from_slice(&buf[1..5]);
                     } else {
-                        // If the buffer is too short, copy available bytes and pad with zeros
-                        let bytes_to_copy = buf.len() - 1; // Subtract 1 because we're starting from index 1
-                        target_bytes[..bytes_to_copy].copy_from_slice(&buf[1..]); // Copy available bytes
+                        let bytes_to_copy: usize = buf.len() - 1;
+                        target_bytes[..bytes_to_copy].copy_from_slice(&buf[1..]);
                     }
-                    
-                    // Now convert to an array
-                    let byte_array: [u8; 4] = target_bytes.try_into().unwrap();
-                    
-                    // Convert to numeric value
+                    let byte_array: [u8; 4] = target_bytes.try_into().unwrap();                  
                     let numeric_value: i32 = i32::from_le_bytes(byte_array);
                     strings.push(Some(numeric_value.to_string()));
+                }
                 }
             2 => {
                     // 4 byte double
@@ -117,40 +107,22 @@ fn get_symbols_as_strings(buf: &[u8], field: &QvdFieldHeader) -> Vec<Option<Stri
                     let byte_array: [u8; 8] = target_bytes.try_into().unwrap();
                     let numeric_value: f64 = f64::from_le_bytes(byte_array);
                     strings.push(Some(numeric_value.to_string()));
-                    // i += 9;
                 }
-                4 => {
+            4 => {        
+                    // Skip the byte `0x04` and start the string after it
                     if buf.len() > 1 {
-                        // First, check for the active/inactive case
-                        if buf[1] == 49 {
-                            // Byte 49 is ASCII for '1', meaning active
-                            strings.push(Some("1".to_string()));
-                        } else if buf[1] == 48 {
-                            // Byte 48 is ASCII for '0', meaning inactive
-                            strings.push(Some("0".to_string()));
-                        } else {
-                            // Otherwise, handle as a regular null-terminated string
-                            let string_buf: &[u8] = &buf[1..]; // Start after `0x04`
+                        let string_buf: &[u8] = &buf[1..]; // Start after the `0x04` byte
                 
-                            if let Some(null_pos) = string_buf.iter().position(|&x| x == 0x00) {
-                                // Take the bytes up to the null terminator
-                                let utf8_bytes: Vec<u8> = string_buf[..null_pos].to_vec();
-                                
-                                // Convert to a UTF-8 string
-                                let value: String = String::from_utf8(utf8_bytes).unwrap_or_else(|_| {
-                                    panic!("Error parsing string value in field: {}", field.field_name)
-                                });
-                                
-                                // Push the resulting string into the `strings` vector
-                                strings.push(Some(value));
-                            } else {
-                                // If there's no null byte, handle as a full string
-                                let value: String = String::from_utf8(string_buf.to_vec()).unwrap_or_else(|_| {
-                                    panic!("Error parsing string value in field: {}", field.field_name)
-                                });
-                                strings.push(Some(value));
-                            }
-                        }
+                        // Assume the string might not have a null terminator and just take the full buffer
+                        let utf8_bytes: Vec<u8> = string_buf.to_vec();
+                
+                        // Convert to a UTF-8 string
+                        let value: String = String::from_utf8(utf8_bytes).unwrap_or_else(|_| {
+                            panic!("Error parsing string value in field: {}", field.field_name)
+                        });
+                        
+                        // Push the resulting string into the `strings` vector
+                        strings.push(Some(value));
                     } else {
                         panic!("Unexpected buffer length for string in field: {}", field.field_name);
                     }
@@ -292,14 +264,13 @@ fn main() -> std::io::Result<()> {
                     column_names.join(", "),
                     placeholders.join(", ")
             );
-            let mut inserted_count: u32 = 0;
-            while inserted_count < 2 {
-                let records_to_insert: &PyDict = read_qvd_to_buf(&mut f, binary_section_offset, &mut qvd_fields, py);
+            let mut record_count: u32 = 0;
+            while record_count < 2 {
+                let records_to_insert: HashMap<String, Vec<Option<String>>> = read_qvd_to_buf(&mut f, binary_section_offset, &mut qvd_fields, record_count as usize);
                 
-                println!("record count: {}", records_to_insert.len());
+                println!("records read: {}", record_count);
 
-                inserted_count += records_to_insert.len() as u32;
-                break;
+                record_count += 1;
             }
     }
     });

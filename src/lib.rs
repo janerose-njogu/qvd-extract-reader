@@ -21,13 +21,13 @@ const DEFAULT_CHUNK_SIZE: usize = 2; // Default chunk size for reading data in G
 
 #[pymodule]
 fn qvd_utils(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(read_qvd, m)?)?;
+    m.add_function(wrap_pyfunction!(read_qvd_file, m)?)?;
 
     Ok(())
 }
 
 #[pyfunction]
-fn read_qvd(py: Python, qvd_file_name: String, chunk_size: Option<usize>) -> PyResult<()> {
+fn read_qvd_file(py: Python, qvd_file_name: String, chunk_size: Option<usize>) -> PyResult<()> {
     let chunk_size_in_bytes: usize = if chunk_size.unwrap_or(0) > 0 {
         chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE) * 1024 * 1024 * 1024
     } else {
