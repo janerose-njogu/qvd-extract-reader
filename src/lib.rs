@@ -60,7 +60,7 @@ fn read_qvd_file(py: Python, qvd_file_name: String, chunk_size: Option<usize>) -
         
         loop {
             // Recursively read the next chunk of the file
-            let buf = read_qvd_extract_data_to_buf(f.try_clone().unwrap(), binary_section_offset, chunk_size_in_bytes);
+            let buf: Vec<u8> = read_qvd_extract_data_to_buf(f.try_clone().unwrap(), binary_section_offset, chunk_size_in_bytes);
             
             // If no more data is read, exit the loop
             if buf.is_empty() {

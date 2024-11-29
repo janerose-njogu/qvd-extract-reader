@@ -31,6 +31,7 @@ libduckdb-sys = "1.0.0"
 duckdb = { version = "1.0.0", features = ["bundled"] }
 regex = "1"
 byteorder = "1.5.0"
+memmap2 = "0.9.5"
 
 [dependencies.pyo3]
 version = "0.12.3"
