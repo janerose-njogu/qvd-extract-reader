@@ -1,11 +1,9 @@
-cargo-features = ["edition2024"]
-
 [toolchain]
 channel = "nightly"
 
 [package]
-name = "qvd_extract_reader"
-version = "1.0.0"
+name = "qvd-extract-reader"
+version = "0.1.0"
 authors = ["Janerose Njogu <janerose.njogu@eoncollective.com>"]
 edition = "2024"
 readme = "README.md"
@@ -14,17 +12,15 @@ license = "Apache-2.0"
 repository = "https://github.com/janerose-njogu/qvd-extract-reader"
 keywords = ["extract", "qlikview", "qlik", "qliksense", "qvd"]
 
-[[bin]]
-name = "qvd_extract_reader_bin"  # Renaming the binary target
-path = "src/main.rs"
-
 [lib]
 name = "qvd_extract_reader"
+# "cdylib" is necessary to produce a shared library for Python to import from.
 crate-type = ["cdylib"]
 
 [dependencies]
+pyo3 = { version = "0.23.2", features = ["extension-module", "abi3-py38"] }
 serde = { version = "1.0.117", features = ["derive"] }
-quick-xml = { version = "0.20.0", features = ["serialize"]}
+quick-xml = { version = "0.37.1", features = ["serialize"]}
 bitvec = "0.19.4"
 csv = "1.1"
 libduckdb-sys = "1.0.0"
@@ -32,8 +28,3 @@ duckdb = { version = "1.0.0", features = ["bundled"] }
 regex = "1"
 byteorder = "1.5.0"
 memmap2 = "0.9.5"
-
-[dependencies.pyo3]
-version = "0.12.3"
-features = ["extension-module"]
-

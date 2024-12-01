@@ -1,3 +1,6 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0", "pandas>=2.2.2"]
+requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
