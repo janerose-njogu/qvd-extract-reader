@@ -1,0 +1,23 @@
+[package]
+name = "qvd_reader"
+version = "0.1.0"
+authors = ["Janerose Njogu <janerose.njogu@eoncollective.com>"]
+edition = "2021"
+readme = "README.md"
+description = "A library for reading data from QVD extract file. Written in Rust."
+license = "Apache-2.0"
+repository = "https://github.com/janerose-njogu/qvd-extract-reader"
+keywords = ["extract", "qlikview", "qlik", "qliksense", "qvd"]
+
+[lib]
+name = "qvd_reader"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.23.1"
+serde = { version = "1.0.117", features = ["derive"] }
+quick-xml = { version = "0.37.1", features = ["serialize"]}
+bitvec = "0.19.4"
+regex = "1"
+byteorder = "1.5.0"
+memmap2 = "0.9.5"
