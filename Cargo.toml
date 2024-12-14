@@ -1,5 +1,5 @@
 [package]
-name = "qvd_reader"
+name = "qvd_utils"
 version = "0.1.0"
 authors = ["Janerose Njogu <janerose.njogu@eoncollective.com>"]
 edition = "2021"
@@ -10,7 +10,7 @@ repository = "https://github.com/janerose-njogu/qvd-extract-reader"
 keywords = ["extract", "qlikview", "qlik", "qliksense", "qvd"]
 
 [lib]
-name = "qvd_reader"
+name = "qvd_utils"
 crate-type = ["cdylib"]
 
 [dependencies]
